@@ -1,0 +1,55 @@
+# Track A GRPO config (TEMPLATE) for agentic coding RL on a single 8xH100 node.
+# verl reads hydra-style config; KEY NAMES VARY BY VERL VERSION — reconcile this
+# with `python -m verl.trainer.main_ppo --help` (or the configs/ in your verl install)
+# after setup.sh, then drive overrides from rl/grpo_qwen3_8b.sh.
+
+algorithm:
+  adv_estimator: grpo          # group-relative advantages (no critic). gspo via importance_sampling_level: sequence
+  kl_ctrl:
+    kl_coef: 0.0               # start KL-free (like chat_rl); raise to ~1e-3 only if entropy collapses
+  use_kl_in_reward: false
+
+data:
+  train_files: data/rl_train.parquet
+  val_files: data/rl_eval.parquet
+  train_batch_size: 64         # prompts per step
+  max_prompt_length: 1024
+  max_response_length: 1024    # raise for multi-turn agentic; watch burst cost
+  return_raw_chat: true        # tools/multi-turn need the raw chat
+
+actor_rollout_ref:
+  model:
+    path: checkpoints/sft_qwen3_8b
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    strategy: fsdp2            # FSDP for a single node; full FT fits 8B on 8xH100
+    optim:
+      lr: 1e-6
+    ppo_mini_batch_size: 64
+    use_kl_loss: false
+    clip_ratio: 0.2            # only bites with rollout reuse; on-policy ratio==1
+  rollout:
+    name: sglang              # mature multi-turn/tool rollout; vllm is a drop-in alt
+    mode: async
+    n: 8                       # GROUP SIZE: rollouts per prompt (GRPO group)
+    temperature: 1.0
+    top_k: 50
+    gpu_memory_utilization: 0.55   # colocated: leave room for FSDP training state
+    multi_turn:
+      enable: true
+      max_turns: 4
+      # tool_config_path: posttrain/rl/tool_config.yaml   # -> posttrain/envs/python_tool.py
+
+custom_reward_function:
+  path: posttrain/envs/code_reward.py
+  name: compute_score          # hidden tests travel in dataset extra_info
+
+trainer:
+  n_gpus_per_node: 8
+  nnodes: 1
+  total_epochs: 2
+  save_freq: 50                # resumable bursts
+  test_freq: 25
+  project_name: nanochat-trackA
+  experiment_name: grpo_qwen3_8b_coding

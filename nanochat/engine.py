@@ -21,62 +21,10 @@ from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 
 # -----------------------------------------------------------------------------
-# Calculator tool helpers
-@contextmanager
-def timeout(duration, formula):
-    def timeout_handler(signum, frame):
-        raise Exception(f"'{formula}': timed out after {duration} seconds")
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(duration)
-    yield
-    signal.alarm(0)
-
-def eval_with_timeout(formula, max_time=3):
-    try:
-        with timeout(max_time, formula):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                return eval(formula, {"__builtins__": {}}, {})
-    except Exception as e:
-        signal.alarm(0)
-        # print(f"Warning: Failed to eval {formula}, exception: {e}") # it's ok ignore wrong calculator usage
-        return None
-
-def use_calculator(expr):
-    """
-    Evaluate a Python expression safely.
-    Supports both math expressions and string operations like .count()
-    """
-    # Remove commas from numbers
-    expr = expr.replace(",", "")
-
-    # Check if it's a pure math expression (old behavior)
-    if all([x in "0123456789*+-/.() " for x in expr]):
-        if "**" in expr:  # disallow power operator
-            return None
-        return eval_with_timeout(expr)
-
-    # Check if it's a string operation we support
-    # Allow: strings (single/double quotes), .count(), letters, numbers, spaces, parens
-    allowed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'\"()._ "
-    if not all([x in allowed_chars for x in expr]):
-        return None
-
-    # Disallow dangerous patterns
-    dangerous_patterns = ['__', 'import', 'exec', 'eval', 'compile', 'open', 'file',
-                         'input', 'raw_input', 'globals', 'locals', 'vars', 'dir',
-                         'getattr', 'setattr', 'delattr', 'hasattr']
-    expr_lower = expr.lower()
-    if any(pattern in expr_lower for pattern in dangerous_patterns):
-        return None
-
-    # Only allow .count() method for now (can expand later)
-    if '.count(' not in expr:
-        return None
-
-    # Evaluate with timeout
-    return eval_with_timeout(expr)
+# Tools (calculator + the pluggable Tool interface) live in nanochat/tools.py.
+# use_calculator is re-exported here for backward compatibility, since it used
+# to be defined in this module.
+from nanochat.tools import use_calculator, CalculatorTool  # noqa: E402,F401
 
 # -----------------------------------------------------------------------------
 class KVCache:
@@ -162,18 +110,79 @@ class RowState:
     def __init__(self, current_tokens=None):
         self.current_tokens = current_tokens or [] # Current token sequence for this row
         self.forced_tokens = deque() # Queue of tokens to force inject
-        self.in_python_block = False # Whether we are inside a python block
-        self.python_expr_tokens = [] # Tokens of the current python expression
         self.completed = False # Whether this row has completed generation
+        # Generalized tool state (replaces the calculator-specific fields)
+        self.active_start = None # start-token id of the currently open tool block, or None
+        self.tool_buffer = []    # tokens accumulated inside the current tool block
+        self.num_tool_turns = 0  # number of tool calls executed so far in this row
+        self.tool_sessions = {}  # tool -> per-row session (lazily created; stateful tools)
+
+    def close_sessions(self):
+        for tool, session in self.tool_sessions.items():
+            tool.close_session(session)
+        self.tool_sessions.clear()
 
 class Engine:
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, tools=None):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+        # Pluggable tools. Default is the original calculator, so existing callers
+        # (Engine(model, tokenizer)) keep byte-identical behavior.
+        if tools is None:
+            tools = [CalculatorTool()]
+        self.tools = tools
+        # Resolve each tool's special tokens to ids once, keyed by its start id.
+        self._tool_specs = {}
+        for tool in tools:
+            start_id = tokenizer.encode_special(tool.start_token)
+            self._tool_specs[start_id] = {
+                "tool": tool,
+                "end_id": tokenizer.encode_special(tool.end_token),
+                "out_start": tokenizer.encode_special(tool.output_start_token),
+                "out_end": tokenizer.encode_special(tool.output_end_token),
+            }
+
+    def _handle_tool_token(self, state, next_token, max_tool_turns=None):
+        """
+        Drive the tool state machine for one token. Mutates `state`: opens a tool
+        block on a start token, buffers tokens inside it, and on the matching end
+        token runs the tool and queues its output between the output tokens for
+        force-injection. Supports multiple turns (the block resets each time), and
+        any tool in self.tools, while preserving the original calculator behavior.
+        """
+        if state.active_start is None:
+            # Not in a tool block: open one iff this token starts a known tool.
+            if next_token in self._tool_specs:
+                state.active_start = next_token
+                state.tool_buffer = []
+            return
+        spec = self._tool_specs[state.active_start]
+        if next_token == spec["end_id"]:
+            buffered = state.tool_buffer
+            state.active_start = None
+            state.tool_buffer = []
+            if not buffered:
+                return
+            # Respect the per-row tool-call cap (None = unlimited, the default).
+            if max_tool_turns is not None and state.num_tool_turns >= max_tool_turns:
+                return
+            state.num_tool_turns += 1
+            tool = spec["tool"]
+            if tool not in state.tool_sessions:
+                state.tool_sessions[tool] = tool.make_session()  # None for stateless tools
+            text = self.tokenizer.decode(buffered)
+            result = tool.run(state.tool_sessions[tool], text)
+            if result is not None:
+                result_tokens = self.tokenizer.encode(str(result))
+                state.forced_tokens.append(spec["out_start"])
+                state.forced_tokens.extend(result_tokens)
+                state.forced_tokens.append(spec["out_end"])
+        else:
+            state.tool_buffer.append(next_token)
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, max_tool_turns=None):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
@@ -187,13 +196,9 @@ class Engine:
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 
-        # Get the special tokens we need to coordinate the tool use state machine
-        get_special = lambda s: self.tokenizer.encode_special(s)
-        python_start = get_special("<|python_start|>")
-        python_end = get_special("<|python_end|>")
-        output_start = get_special("<|output_start|>")
-        output_end = get_special("<|output_end|>")
-        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
+        # Special tokens that terminate a row. Tool tokens are handled per-tool
+        # via self._tool_specs inside _handle_tool_token.
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
         # 1) Run a batch 1 prefill of the prompt tokens
@@ -253,23 +258,10 @@ class Engine:
                 # On <|assistant_end|> or <|bos|>, mark the row as completed
                 if next_token == assistant_end or next_token == bos:
                     state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
+                    state.close_sessions() # free any tool subprocesses early
+                else:
+                    # Drive the (multi-turn, pluggable) tool state machine
+                    self._handle_tool_token(state, next_token, max_tool_turns)
 
             # Yield the token column
             yield token_column, token_masks
@@ -278,6 +270,11 @@ class Engine:
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
             logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+
+        # Cleanup any remaining per-row tool sessions (rows that hit max_tokens
+        # without emitting an end token). Completed rows already closed theirs.
+        for state in row_states:
+            state.close_sessions()
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

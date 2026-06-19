@@ -347,3 +347,165 @@ def execute_code(
         memory_exceeded=result_dict["memory_exceeded"],
     )
 
+
+# -----------------------------------------------------------------------------
+# Persistent (stateful) Python REPL for multi-turn agentic tool use.
+#
+# `execute_code` above runs each snippet in a fresh subprocess with a fresh
+# namespace, so nothing persists between calls. For an agent that writes a
+# function in one turn and tests it in the next, we need a *long-lived* worker
+# that keeps `exec_globals` alive across calls. That is what this provides.
+#
+# Important: we use the "spawn" start method, NOT fork. During RL the parent
+# process has CUDA initialized, and forking a CUDA process is unsafe; spawn
+# starts a clean interpreter and sidesteps that entirely.
+
+def _format_output(stdout, stderr, error, max_chars):
+    parts = []
+    if stdout and stdout.strip():
+        parts.append(stdout.rstrip())
+    if error:
+        parts.append(f"Error: {error}")
+    elif stderr and stderr.strip():
+        parts.append(stderr.rstrip())
+    text = "\n".join(parts) if parts else "(no output)"
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...(truncated)"
+    return text
+
+
+def format_execution_output(result: ExecutionResult, max_chars: int = 1500) -> str:
+    """Render an ExecutionResult into the short text fed back to the model as tool output."""
+    return _format_output(result.stdout, result.stderr, result.error, max_chars)
+
+
+def _session_worker(conn, maximum_memory_bytes):
+    """Runs in a spawned child process: one persistent namespace, exec on demand."""
+    reliability_guard(maximum_memory_bytes=maximum_memory_bytes)  # applied once for the session
+    exec_globals = {"__name__": "__main__"}
+    while True:
+        try:
+            msg = conn.recv()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if msg is None:  # shutdown sentinel
+            break
+        code, timeout = msg
+        result = {"success": False, "stdout": "", "stderr": "",
+                  "error": None, "timeout": False, "memory_exceeded": False}
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                    redirect_stdin(WriteOnlyStringIO()):
+                with time_limit(timeout):
+                    exec(code, exec_globals)
+            result["success"] = True
+        except TimeoutException:
+            result["timeout"] = True
+            result["error"] = "Execution timed out"
+        except MemoryError as e:
+            result["memory_exceeded"] = True
+            result["error"] = f"Memory limit exceeded: {e}"
+        except SystemExit as e:
+            result["error"] = f"SystemExit: {e}"
+        except BaseException as e:
+            result["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            result["stdout"] = out.getvalue()
+            result["stderr"] = err.getvalue()
+        try:
+            conn.send(result)
+        except BrokenPipeError:
+            break
+
+
+class PersistentPythonSession:
+    """
+    A stateful Python REPL backed by a long-lived spawned subprocess.
+
+    Variables, imports, and function definitions persist across `run()` calls,
+    enabling multi-turn agentic coding (define in turn 1, test in turn 2). If a
+    call hangs past its timeout or the worker dies, the session is transparently
+    restarted (state is lost) and an error ExecutionResult is returned.
+
+        sess = PersistentPythonSession()
+        sess.run("x = 40")
+        sess.run("print(x + 2)").stdout   # -> '42\\n'
+        sess.close()
+    """
+
+    def __init__(self, timeout: float = 5.0,
+                 maximum_memory_bytes: Optional[int] = 256 * 1024 * 1024):
+        self.timeout = timeout
+        self.maximum_memory_bytes = maximum_memory_bytes
+        self._ctx = multiprocessing.get_context("spawn")
+        self._proc = None
+        self._conn = None
+        self._start()
+
+    def _start(self):
+        self._conn, child_conn = self._ctx.Pipe()
+        self._proc = self._ctx.Process(
+            target=_session_worker,
+            args=(child_conn, self.maximum_memory_bytes),
+            daemon=True,
+        )
+        self._proc.start()
+        child_conn.close()  # parent keeps only its end
+
+    def run(self, code: str, timeout: Optional[float] = None) -> ExecutionResult:
+        timeout = self.timeout if timeout is None else timeout
+        if self._proc is None or not self._proc.is_alive():
+            self._start()  # restart a dead session (namespace is lost)
+        try:
+            self._conn.send((code, timeout))
+        except (BrokenPipeError, OSError):
+            self.restart()
+            return ExecutionResult(success=False, stdout="", stderr="",
+                                   error="Session pipe broken; restarted")
+        # Backstop: the worker enforces its own timeout, but if it is truly
+        # stuck (e.g. signal swallowed) we kill and restart it here.
+        if not self._conn.poll(timeout + 2.0):
+            self.restart()
+            return ExecutionResult(success=False, stdout="", stderr="",
+                                   error="Execution timed out (session killed)", timeout=True)
+        try:
+            result = self._conn.recv()
+        except (EOFError, OSError):
+            self.restart()
+            return ExecutionResult(success=False, stdout="", stderr="",
+                                   error="Session died during execution")
+        return ExecutionResult(**result)
+
+    def run_str(self, code: str, timeout: Optional[float] = None, max_chars: int = 1500) -> str:
+        """Convenience: run code and return the formatted tool-output string."""
+        return format_execution_output(self.run(code, timeout=timeout), max_chars=max_chars)
+
+    def restart(self):
+        self.close()
+        self._start()
+
+    def close(self):
+        if self._proc is not None:
+            try:
+                self._conn.send(None)
+            except Exception:
+                pass
+            self._proc.terminate()
+            self._proc.join(timeout=2.0)
+            if self._proc.is_alive():
+                self._proc.kill()
+            self._proc = None
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
