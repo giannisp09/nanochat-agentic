@@ -10,6 +10,7 @@
 #   bash runs/agent_speedrun.sh
 #   WANDB_RUN=agentrl bash runs/agent_speedrun.sh   # with logging
 
+set -euo pipefail   # stop at the first failing stage instead of cascading
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 source .venv/bin/activate
