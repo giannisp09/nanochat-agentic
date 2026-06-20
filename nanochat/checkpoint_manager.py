@@ -43,7 +43,7 @@ def _patch_missing_keys(model_data, reference_sd):
     """
     missing = [k for k in reference_sd if k not in model_data]
     if not missing:
-        return
+        return missing
     for k in missing:
         ref = reference_sd[k]
         base = k.split(".")[-1]
@@ -59,6 +59,7 @@ def _patch_missing_keys(model_data, reference_sd):
         model_data[k] = val
     log0(f"Patched {len(missing)} missing key(s) from old checkpoint with no-op defaults "
          f"(value-embeds/smear/backout disabled where applicable)")
+    return missing
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -124,8 +125,17 @@ def build_model(checkpoint_dir, step, device, phase):
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     # Back-compat: fill params missing from old checkpoints with no-op defaults, using the
     # freshly-built model's tensors as device/dtype-correct references (for assign=True).
-    _patch_missing_keys(model_data, model.state_dict())
+    patched = _patch_missing_keys(model_data, model.state_dict())
     model.load_state_dict(model_data, strict=True, assign=True)
+    # If value embeddings were absent from the checkpoint (patched to no-op zeros), drop the
+    # modules entirely. forward() handles missing layers via `if str(i) in self.value_embeds`
+    # (ve=None => zero contribution, identical to the zeros), and this reclaims a large amount
+    # of optimizer memory during training (these tables are ~vocab*kv_dim per layer) and keeps
+    # the old model faithful (the disabled embeddings can't drift away from zero).
+    if any("value_embeds" in k for k in patched) and len(model.value_embeds) > 0:
+        n_ve = len(model.value_embeds)
+        model.value_embeds = torch.nn.ModuleDict()
+        log0(f"Dropped {n_ve} disabled value-embedding table(s) from old checkpoint (reclaims optimizer memory)")
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()

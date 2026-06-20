@@ -13,6 +13,7 @@ set -euo pipefail
 
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # reduce fragmentation OOMs
 source .venv/bin/activate
 WANDB_RUN="${WANDB_RUN:-dummy}"
 NPROC="${NPROC_PER_NODE:-8}"
@@ -34,13 +35,13 @@ fi
 # 1) SANITY: GSM8K calculator RL (dense reward) — validates the whole loop fast.
 torchrun --standalone --nproc_per_node=$NPROC -m scripts.agent_rl -- \
     --task=gsm8k --objective=grpo --adv-norm=zscore \
-    --group-size=16 --max-tool-turns=2 --num-epochs=1 \
+    --group-size=16 --device-batch-size=4 --max-tool-turns=2 --num-epochs=1 \
     --eval-examples=16 --run=$WANDB_RUN
 
 # 2) MILESTONE: agentic CODING RL with sandboxed execution + verifiable reward.
 torchrun --standalone --nproc_per_node=$NPROC -m scripts.agent_rl -- \
     --task=coding --objective=grpo --adv-norm=zscore \
-    --group-size=16 --max-tool-turns=4 --max-new-tokens=768 \
+    --group-size=16 --device-batch-size=4 --max-tool-turns=4 --max-new-tokens=768 \
     --num-epochs=2 --eval-examples=16 --run=$WANDB_RUN
 
 echo "Done. Inspect pass@k in the agent_rl logs / wandb run '$WANDB_RUN'."
