@@ -11,6 +11,10 @@
 # agent_speedrun's coding/tool-use SFT seed (chat_sft) continues on top of it.
 set -euo pipefail
 
+# Activate the repo venv if present (so `hf` / python deps are available).
+[ -f ".venv/bin/activate" ] && source .venv/bin/activate || true
+PY="$(command -v python3 || command -v python)"
+
 BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 REPO="karpathy/nanochat-d32"
 
@@ -23,7 +27,7 @@ if command -v hf >/dev/null 2>&1; then
     hf download "$REPO" model_000650.pt meta_000650.json --local-dir "$CKPT_DIR"
     hf download "$REPO" tokenizer.pkl token_bytes.pt    --local-dir "$TOK_DIR"
 else
-    python - "$REPO" "$CKPT_DIR" "$TOK_DIR" <<'PY'
+    "$PY" - "$REPO" "$CKPT_DIR" "$TOK_DIR" <<'PY'
 import sys
 from huggingface_hub import hf_hub_download
 repo, ckpt_dir, tok_dir = sys.argv[1:4]
