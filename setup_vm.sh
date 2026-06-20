@@ -19,7 +19,9 @@ echo "==> nanochat-agentic VM setup (extra=$EXTRA)"
 if command -v apt-get >/dev/null 2>&1; then
     echo "==> apt: git curl build-essential"
     SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
-    $SUDO apt-get update -y && $SUDO apt-get install -y git curl build-essential || \
+    # python3-dev provides Python.h, which Triton needs to JIT-compile CUDA kernels
+    # (torch.compile in the optimizer). Without it: "fatal error: Python.h: No such file".
+    $SUDO apt-get update -y && $SUDO apt-get install -y git curl build-essential python3-dev || \
         echo "   (apt step skipped/failed — continuing; usually already present)"
 fi
 
