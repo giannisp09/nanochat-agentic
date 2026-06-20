@@ -34,12 +34,13 @@ fi
 # 1) SANITY: GSM8K calculator RL (dense reward) — validates the whole loop fast.
 torchrun --standalone --nproc_per_node=$NPROC -m scripts.agent_rl -- \
     --task=gsm8k --objective=grpo --adv-norm=zscore \
-    --group-size=16 --max-tool-turns=2 --num-epochs=1 --run=$WANDB_RUN
+    --group-size=16 --max-tool-turns=2 --num-epochs=1 \
+    --eval-examples=16 --run=$WANDB_RUN
 
 # 2) MILESTONE: agentic CODING RL with sandboxed execution + verifiable reward.
 torchrun --standalone --nproc_per_node=$NPROC -m scripts.agent_rl -- \
     --task=coding --objective=grpo --adv-norm=zscore \
     --group-size=16 --max-tool-turns=4 --max-new-tokens=768 \
-    --num-epochs=2 --run=$WANDB_RUN
+    --num-epochs=2 --eval-examples=16 --run=$WANDB_RUN
 
 echo "Done. Inspect pass@k in the agent_rl logs / wandb run '$WANDB_RUN'."
