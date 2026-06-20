@@ -13,7 +13,7 @@ set -euo pipefail
 
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # reduce fragmentation OOMs
+export PYTORCH_ALLOC_CONF=expandable_segments:True  # reduce fragmentation OOMs (torch>=2.9 name)
 source .venv/bin/activate
 WANDB_RUN="${WANDB_RUN:-dummy}"
 NPROC="${NPROC_PER_NODE:-8}"

@@ -135,7 +135,15 @@ def build_model(checkpoint_dir, step, device, phase):
     if any("value_embeds" in k for k in patched) and len(model.value_embeds) > 0:
         n_ve = len(model.value_embeds)
         model.value_embeds = torch.nn.ModuleDict()
-        log0(f"Dropped {n_ve} disabled value-embedding table(s) from old checkpoint (reclaims optimizer memory)")
+        # The per-layer ve_gate Linears are only used when ve is not None (gpt.py attn forward).
+        # With value_embeds gone, ve is always None, so ve_gate never runs and would otherwise
+        # sit in the Muon optimizer group with grad=None -> crash. Drop them too.
+        n_gate = 0
+        for block in model.transformer.h:
+            if getattr(block.attn, "ve_gate", None) is not None:
+                block.attn.ve_gate = None
+                n_gate += 1
+        log0(f"Dropped {n_ve} disabled value-embedding table(s) and {n_gate} ve_gate(s) from old checkpoint (reclaims optimizer memory)")
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
