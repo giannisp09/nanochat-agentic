@@ -27,17 +27,38 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
 
-def _patch_missing_keys(model_data, model_config):
-    """Add default values for new parameters that may be missing in old checkpoints."""
-    n_layer = model_config.n_layer
-    # resid_lambdas defaults to 1.0 (identity scaling)
-    if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
-        log0(f"Patching missing resid_lambdas in model data to 1.0")
-    # x0_lambdas defaults to 0.0 (disabled)
-    if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
-        log0(f"Patching missing x0_lambdas in model data to 0.0")
+def _patch_missing_keys(model_data, reference_sd):
+    """Fill params missing from an old checkpoint with NO-OP defaults so the loaded
+    weights behave exactly as trained. Released checkpoints (e.g. karpathy/nanochat-d32)
+    predate features added later to gpt.py; each missing param is set to the value that
+    makes its feature a no-op. Reference tensors come from the freshly-built model, so
+    shape/device/dtype always match (required for load_state_dict(assign=True)).
+
+    No-op values (verified against gpt.py forward):
+      resid_lambdas -> 1.0   (x = 1*x + ... : identity residual scale)
+      x0_lambdas    -> 0.0   (x0 blend disabled)
+      smear_lambda  -> 0.0   (gate = smear_lambda*sigmoid(...) = 0 : no smear)
+      backout_lambda-> 0.0   (x = x - 0*x_backout : no backout)
+      value_embeds.*/ve_gate/smear_gate -> 0  (v = v + gate*ve, ve=0 : no contribution)
+    """
+    missing = [k for k in reference_sd if k not in model_data]
+    if not missing:
+        return
+    for k in missing:
+        ref = reference_sd[k]
+        base = k.split(".")[-1]
+        if base == "resid_lambdas":
+            val = torch.ones_like(ref)                  # identity residual scaling
+        elif base in ("x0_lambdas", "smear_lambda", "backout_lambda"):
+            val = torch.zeros_like(ref)                 # feature disabled
+        elif ("value_embeds" in k) or ("ve_gate" in k) or ("smear_gate" in k):
+            val = torch.zeros_like(ref)                 # zero => contributes nothing
+        else:
+            val = ref.clone()                           # unknown new param: fresh init
+            log0(f"WARNING: checkpoint missing '{k}' with no no-op rule; using fresh init (may change behavior)")
+        model_data[k] = val
+    log0(f"Patched {len(missing)} missing key(s) from old checkpoint with no-op defaults "
+         f"(value-embeds/smear/backout disabled where applicable)")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -96,12 +117,14 @@ def build_model(checkpoint_dir, step, device, phase):
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    # Back-compat: fill params missing from old checkpoints with no-op defaults, using the
+    # freshly-built model's tensors as device/dtype-correct references (for assign=True).
+    _patch_missing_keys(model_data, model.state_dict())
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
